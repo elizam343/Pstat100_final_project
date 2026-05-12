@@ -11,7 +11,7 @@ Type of modeling: Supervised learning — regression and classification.
 - Model comparison: Cross-validated RMSE (regression) and AUC-ROC (classification).
 
 ## Required Steps
-·      Data problems: Merging across sources (name inconsistencies), structurally missing MLB stats for players who never reached the majors, duplicate multi-season college records, type correction, and restructuring to one row per player.
-·      Feature engineering: K:BB ratio, isolated power (ISO), WHIP.
-·      EDA: Distribution plots, correlation heatmap of college predictors vs. MLB outcomes, draft round scatter plots, team-level aggregations.
+- Data problems: Merging across sources (name inconsistencies), structurally missing MLB stats for players who never reached the majors, duplicate multi-season college records, type correction, and restructuring to one row per player.
+- Feature engineering: K:BB ratio, isolated power (ISO), WHIP.
+- EDA: Distribution plots, correlation heatmap of college predictors vs. MLB outcomes, draft round scatter plots, team-level aggregations.
 
