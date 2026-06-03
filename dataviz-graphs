@@ -1,0 +1,501 @@
+# =============================================================================
+# PSTAT 100 Final Project — NBA Draft Analytics
+# Team: [Your Names Here]  |  Spring 2026
+# Data: nbaplayersdraft.csv (Kaggle, 2018–2021 drafts only, n=240)
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+import os
+import warnings
+
+# ── Force interactive backend BEFORE importing pyplot ────────────────────────
+import matplotlib
+matplotlib.use("TkAgg")
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import seaborn as sns
+from matplotlib.gridspec import GridSpec
+
+from sklearn.model_selection import train_test_split, GridSearchCV, KFold, cross_val_score
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
+from sklearn.metrics import (
+    root_mean_squared_error, r2_score,
+    roc_auc_score, roc_curve,
+)
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+warnings.filterwarnings("ignore")
+sns.set_theme(style="whitegrid", palette="muted", font_scale=1.1)
+SEED = 42
+
+# =============================================================================
+# SECTION 1: DATA LOADING
+# =============================================================================
+print("=" * 70)
+print("SECTION 1: DATA LOADING")
+print("=" * 70)
+
+# ── Try user-supplied path first, then uploaded location ─────────────────────
+PATHS = [
+    r"C:\Users\natha\Downloads\nbaplayersdraft.csv",
+    "/mnt/user-data/uploads/nbaplayersdraft.csv",
+]
+df_raw = None
+for p in PATHS:
+    if os.path.exists(p):
+        df_raw = pd.read_csv(p)
+        print(f"[INFO] Loaded: {p}  →  {df_raw.shape[0]} rows × {df_raw.shape[1]} cols")
+        break
+
+if df_raw is None:
+    raise FileNotFoundError("nbaplayersdraft.csv not found. Place it in Downloads or re-upload.")
+
+# ── Filter to 2018 NBA Draft and later ───────────────────────────────────────
+# NOTE: 2018-2021 gives 240 players (60 per draft class).
+# Max career length in this window is 4 seasons (2018 draftees as of 2021).
+# We use "3+ seasons" as the longevity classification target.
+DRAFT_YEAR_MIN = 2018
+df_raw = df_raw[df_raw["year"] >= DRAFT_YEAR_MIN].reset_index(drop=True)
+print(f"[INFO] Filtered to {DRAFT_YEAR_MIN}+ drafts  ->  {len(df_raw)} rows")
+
+# =============================================================================
+# SECTION 2: RENAMING & INITIAL INSPECTION
+# =============================================================================
+print("\n" + "=" * 70)
+print("SECTION 2: COLUMN STANDARDISATION & INSPECTION")
+print("=" * 70)
+
+df_raw.rename(columns={
+    'player':                    'Player_Name',
+    'year':                      'Draft_Year',
+    'overall_pick':              'Overall_Pick',
+    'rank':                      'Draft_Rank',
+    'team':                      'Drafting_Team',
+    'college':                   'College',
+    'years_active':              'NBA_Years_Active',
+    'games':                     'NBA_Games',
+    'minutes_played':            'NBA_MIN',
+    'points':                    'NBA_PTS',
+    'total_rebounds':            'NBA_REB',
+    'assists':                   'NBA_AST',
+    'field_goal_percentage':     'NBA_FG_pct',
+    '3_point_percentage':        'NBA_3P_pct',
+    'free_throw_percentage':     'NBA_FT_pct',
+    'average_minutes_played':    'NBA_MPG',
+    'points_per_game':           'NBA_PPG',
+    'average_total_rebounds':    'NBA_RPG',
+    'average_assists':           'NBA_APG',
+    'win_shares':                'NBA_WS',
+    'win_shares_per_48_minutes': 'NBA_WS_48',
+    'box_plus_minus':            'NBA_BPM',
+    'value_over_replacement':    'NBA_VORP',
+}, inplace=True)
+
+print("\nDtypes:")
+print(df_raw.dtypes.to_string())
+
+# =============================================================================
+# SECTION 3: MISSINGNESS & DUPLICATES
+# =============================================================================
+print("\n" + "=" * 70)
+print("SECTION 3: MISSINGNESS & DUPLICATES")
+print("=" * 70)
+
+miss = df_raw.isnull().sum()
+miss_pct = (miss / len(df_raw) * 100).round(2)
+miss_df = pd.DataFrame({'Missing Count': miss, 'Missing %': miss_pct})
+miss_df = miss_df[miss_df['Missing Count'] > 0].sort_values('Missing Count', ascending=False)
+print("\nMissing Values:")
+print(miss_df.to_string())
+
+# Structural missingness: NaN years_active = never played in NBA
+df_raw['Never_Appeared'] = df_raw['NBA_Years_Active'].isna().astype(int)
+df_raw['NBA_Years_Active'] = df_raw['NBA_Years_Active'].fillna(0)
+print(f"\nPlayers who never appeared: {df_raw['Never_Appeared'].sum()} "
+      f"({df_raw['Never_Appeared'].mean()*100:.1f}%)")
+
+# Fill remaining numeric NaNs with 0 (structurally missing = didn't play)
+numeric_fill = ['NBA_Games','NBA_MIN','NBA_PTS','NBA_REB','NBA_AST',
+                'NBA_FG_pct','NBA_3P_pct','NBA_FT_pct','NBA_MPG',
+                'NBA_PPG','NBA_RPG','NBA_APG','NBA_WS','NBA_BPM','NBA_VORP']
+df_raw[numeric_fill] = df_raw[numeric_fill].fillna(0)
+
+# Duplicates
+n_dups = df_raw.duplicated(subset=['Player_Name','Draft_Year']).sum()
+print(f"\nDuplicate (Player, Year) rows: {n_dups}")
+if n_dups > 0:
+    df_raw = df_raw.drop_duplicates(subset=['Player_Name','Draft_Year'], keep='last')
+
+# =============================================================================
+# SECTION 4: FEATURE ENGINEERING
+# =============================================================================
+print("\n" + "=" * 70)
+print("SECTION 4: FEATURE ENGINEERING")
+print("=" * 70)
+
+df = df_raw.copy()
+
+# Draft metadata
+df['Draft_Round']   = np.where(df['Overall_Pick'] <= 30, 1, 2)
+df['Pick_Tier']     = pd.cut(df['Overall_Pick'],
+                              bins=[0,5,10,20,30,45,60],
+                              labels=['1-5','6-10','11-20','21-30','31-45','46-60'])
+
+# Longevity labels
+df['Sustained_3Plus'] = (df['NBA_Years_Active'] >= 3).astype(int)
+df['Longevity_Group'] = pd.cut(
+    df['NBA_Years_Active'],
+    bins=[-0.1, 0, 2.9, 7, 100],
+    labels=['Never Appeared','1–2 Seasons','3–7 Seasons','8+ Seasons']
+)
+
+# Has college listed
+df['Has_College'] = df['College'].notna().astype(int)
+
+print(f"Final dataset shape: {df.shape}")
+print("\nLongevity distribution:")
+print(df['Longevity_Group'].value_counts().to_string())
+
+# =============================================================================
+# SECTION 5: EXPLORATORY DATA ANALYSIS
+# =============================================================================
+print("\n" + "=" * 70)
+print("SECTION 5: EDA")
+print("=" * 70)
+
+df_ws = df[df['NBA_WS_48'] != 0].copy()   # players who actually played
+
+fig_eda, axes = plt.subplots(2, 3, figsize=(18, 11))
+fig_eda.suptitle('PSTAT 100 — NBA Draft Analytics: EDA Dashboard',
+                 fontsize=18, fontweight='bold', y=0.98)
+
+# ── 5.1 WS/48 Distribution by Draft Round ────────────────────────────────────
+ax = axes[0, 0]
+for r, c in zip([1, 2], ['steelblue', 'coral']):
+    sub = df_ws[df_ws['Draft_Round'] == r]['NBA_WS_48']
+    ax.hist(sub, bins=35, alpha=0.6, color=c, edgecolor='white',
+            label=f'Round {r} (n={len(sub)})')
+ax.axvline(0, color='red', linestyle='--', linewidth=1.2, label='Replacement level')
+ax.set_title('WS/48 Distribution by Draft Round', fontweight='bold')
+ax.set_xlabel('NBA WS/48')
+ax.set_ylabel('Count')
+ax.legend(fontsize=9)
+
+# ── 5.2 Median WS/48 by Pick Tier ────────────────────────────────────────────
+ax = axes[0, 1]
+bucket_stats = (df_ws.groupby('Pick_Tier', observed=True)['NBA_WS_48']
+                .median().reset_index())
+ax.bar(bucket_stats['Pick_Tier'].astype(str), bucket_stats['NBA_WS_48'],
+       color='steelblue', edgecolor='white')
+ax.set_title('Median WS/48 by Draft Pick Range', fontweight='bold')
+ax.set_xlabel('Overall Pick Range')
+ax.set_ylabel('Median WS/48')
+ax.axhline(0, color='red', linestyle='--', linewidth=1)
+
+# ── 5.3 Longevity Group Counts ────────────────────────────────────────────────
+ax = axes[0, 2]
+pal = {'Never Appeared':'#d9534f','1–2 Seasons':'#f0ad4e',
+       '3–7 Seasons':'#5bc0de','8+ Seasons':'#5cb85c'}
+counts = df['Longevity_Group'].value_counts()
+bars = ax.bar(counts.index.astype(str), counts.values,
+              color=[pal.get(k,'grey') for k in counts.index.astype(str)],
+              edgecolor='white')
+ax.bar_label(bars, padding=3, fontsize=9)
+ax.set_title('Career Longevity Distribution', fontweight='bold')
+ax.set_ylabel('Number of Players')
+ax.set_xticklabels(counts.index.astype(str), rotation=20, ha='right')
+
+# ── 5.4 PPG vs WS/48 scatter ─────────────────────────────────────────────────
+ax = axes[1, 0]
+sc = ax.scatter(df_ws['NBA_PPG'], df_ws['NBA_WS_48'],
+                c=df_ws['Overall_Pick'], cmap='viridis_r',
+                alpha=0.5, s=20, edgecolors='none')
+plt.colorbar(sc, ax=ax, label='Overall Pick #')
+ax.set_title('PPG vs WS/48\n(colour = pick number)', fontweight='bold')
+ax.set_xlabel('NBA Points Per Game')
+ax.set_ylabel('NBA WS/48')
+ax.axhline(0, color='red', linestyle='--', linewidth=0.8)
+
+# ── 5.5 Years Active by Draft Round (boxplot) ─────────────────────────────────
+ax = axes[1, 1]
+sns.boxplot(data=df, x='Draft_Round', y='NBA_Years_Active',
+            palette=['steelblue','coral'], ax=ax,
+            order=[1, 2])
+ax.set_title('NBA Years Active by Draft Round', fontweight='bold')
+ax.set_xlabel('Draft Round')
+ax.set_ylabel('Years Active')
+
+# ── 5.6 Correlation Heatmap ───────────────────────────────────────────────────
+ax = axes[1, 2]
+corr_cols = ['Overall_Pick','NBA_Years_Active','NBA_PPG',
+             'NBA_RPG','NBA_APG','NBA_FG_pct','NBA_WS_48']
+corr_matrix = df_ws[corr_cols].corr()
+mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+sns.heatmap(corr_matrix, mask=mask, annot=True, fmt='.2f',
+            cmap='coolwarm', vmin=-1, vmax=1, ax=ax,
+            cbar_kws={'shrink':0.8}, linewidths=0.5)
+ax.set_title('Correlation Matrix', fontweight='bold')
+ax.set_xticklabels(ax.get_xticklabels(), rotation=35, ha='right', fontsize=8)
+ax.set_yticklabels(ax.get_yticklabels(), fontsize=8)
+
+fig_eda.tight_layout(rect=[0, 0, 1, 0.96])
+fig_eda.savefig('PSTAT100_EDA_Dashboard.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("  [Saved] PSTAT100_EDA_Dashboard.png")
+
+# =============================================================================
+# SECTION 6: MODELING
+# =============================================================================
+print("\n" + "=" * 70)
+print("SECTION 6: MODELING")
+print("=" * 70)
+
+# Features available pre-draft (pick, round) + career-per-game stats
+# NOTE: For a true predictive model use only pre-draft features.
+# Per-game stats are included here to demonstrate associations.
+FEATURES = ['Overall_Pick', 'Draft_Round', 'NBA_PPG', 'NBA_RPG',
+            'NBA_APG', 'NBA_FG_pct', 'NBA_FT_pct']
+
+# ── Regression subset ─────────────────────────────────────────────────────────
+df_reg = df_ws[FEATURES + ['NBA_WS_48']].dropna().copy()
+X_reg  = df_reg[FEATURES]
+y_reg  = df_reg['NBA_WS_48']
+
+X_tr, X_te, y_tr, y_te = train_test_split(X_reg, y_reg,
+                                            test_size=0.2, random_state=SEED)
+kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
+
+# ── Classification subset ─────────────────────────────────────────────────────
+df_clf = df[FEATURES + ['Sustained_3Plus']].dropna().copy()
+X_clf  = df_clf[FEATURES]
+y_clf  = df_clf['Sustained_3Plus']
+X_tr_c, X_te_c, y_tr_c, y_te_c = train_test_split(
+    X_clf, y_clf, test_size=0.2, random_state=SEED, stratify=y_clf)
+
+# ---------------------------------------------------------------------------
+# 6A. Regression — OLS vs Ridge vs Random Forest
+# ---------------------------------------------------------------------------
+print("\n── 6A. Regression Models ──")
+
+pipelines_reg = {
+    'OLS Baseline':     Pipeline([('sc', StandardScaler()), ('m', LinearRegression())]),
+    'Ridge Regression': Pipeline([('sc', StandardScaler()), ('m', Ridge(alpha=1.0))]),
+    'Random Forest':    Pipeline([('sc', StandardScaler()),
+                                  ('m', RandomForestRegressor(n_estimators=100,
+                                                              max_depth=10,
+                                                              random_state=SEED))]),
+}
+
+reg_results = {}
+for name, pipe in pipelines_reg.items():
+    cv_rmse = -cross_val_score(pipe, X_tr, y_tr,
+                               cv=kf, scoring='neg_root_mean_squared_error').mean()
+    pipe.fit(X_tr, y_tr)
+    y_pred    = pipe.predict(X_te)
+    test_rmse = root_mean_squared_error(y_te, y_pred)
+    test_r2   = r2_score(y_te, y_pred)
+    reg_results[name] = {'CV RMSE': round(cv_rmse, 4),
+                         'Test RMSE': round(test_rmse, 4),
+                         'Test R²': round(test_r2, 4)}
+    print(f"  {name:20s}  CV RMSE={cv_rmse:.4f}  Test RMSE={test_rmse:.4f}  R²={test_r2:.4f}")
+
+reg_results_df = pd.DataFrame(reg_results).T
+
+# ── GridSearchCV tuning ───────────────────────────────────────────────────────
+print("\n  [Tuning] Random Forest GridSearchCV...")
+rf_pipe   = Pipeline([('sc', StandardScaler()),
+                       ('rf', RandomForestRegressor(random_state=SEED))])
+rf_params = {'rf__n_estimators':[50,100,200],
+             'rf__max_depth':[5,10,None],
+             'rf__min_samples_split':[2,5]}
+rf_grid   = GridSearchCV(rf_pipe, rf_params, cv=kf,
+                          scoring='neg_root_mean_squared_error', n_jobs=-1)
+rf_grid.fit(X_tr, y_tr)
+
+y_pred_rf    = rf_grid.predict(X_te)
+rf_test_rmse = root_mean_squared_error(y_te, y_pred_rf)
+rf_test_r2   = r2_score(y_te, y_pred_rf)
+print(f"  Best params : {rf_grid.best_params_}")
+print(f"  CV RMSE     : {-rf_grid.best_score_:.4f}")
+print(f"  Test RMSE   : {rf_test_rmse:.4f}  R²: {rf_test_r2:.4f}")
+
+best_rf      = rf_grid.best_estimator_.named_steps['rf']
+feat_imp_df  = pd.DataFrame({'Feature': FEATURES,
+                              'Importance': best_rf.feature_importances_}
+                             ).sort_values('Importance', ascending=False)
+
+# ---------------------------------------------------------------------------
+# 6B. Classification — Logistic Regression vs RF Classifier
+# ---------------------------------------------------------------------------
+print("\n── 6B. Classification (Predicting 3+ Season Career) ──")
+
+pipelines_clf = {
+    'Logistic Regression': Pipeline([('sc', StandardScaler()),
+                                     ('m', LogisticRegression(max_iter=500,
+                                                              random_state=SEED))]),
+    'RF Classifier':       Pipeline([('sc', StandardScaler()),
+                                     ('m', RandomForestClassifier(n_estimators=100,
+                                                                   max_depth=10,
+                                                                   random_state=SEED))]),
+}
+
+clf_results = {}
+for name, pipe in pipelines_clf.items():
+    cv_auc   = cross_val_score(pipe, X_tr_c, y_tr_c, cv=kf, scoring='roc_auc').mean()
+    pipe.fit(X_tr_c, y_tr_c)
+    y_prob   = pipe.predict_proba(X_te_c)[:, 1]
+    test_auc = roc_auc_score(y_te_c, y_prob)
+    clf_results[name] = {'CV AUC': round(cv_auc, 4), 'Test AUC': round(test_auc, 4)}
+    print(f"  {name:22s}  CV AUC={cv_auc:.4f}  Test AUC={test_auc:.4f}")
+
+# =============================================================================
+# SECTION 7: RESULTS DASHBOARD
+# =============================================================================
+print("\n" + "=" * 70)
+print("SECTION 7: RESULTS VISUALISATION")
+print("=" * 70)
+
+fig_res = plt.figure(figsize=(18, 14))
+fig_res.suptitle('PSTAT 100 — NBA Draft Analytics: Modeling Results',
+                 fontsize=18, fontweight='bold', y=0.98)
+gs = GridSpec(2, 3, figure=fig_res, hspace=0.42, wspace=0.32)
+
+# ── A: Predicted vs Actual ────────────────────────────────────────────────────
+ax_a = fig_res.add_subplot(gs[0, 0])
+ax_a.scatter(y_te, y_pred_rf, alpha=0.4, s=30, color='steelblue', edgecolors='none')
+lims = [min(y_te.min(), y_pred_rf.min()), max(y_te.max(), y_pred_rf.max())]
+ax_a.plot(lims, lims, 'r--', linewidth=1.5, label='Perfect fit')
+ax_a.set_title('Predicted vs Actual WS/48\n(Tuned RF)', fontweight='bold')
+ax_a.set_xlabel('Actual WS/48')
+ax_a.set_ylabel('Predicted WS/48')
+ax_a.text(0.05, 0.90, f'R²={rf_test_r2:.3f}\nRMSE={rf_test_rmse:.4f}',
+          transform=ax_a.transAxes, fontsize=9,
+          bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+ax_a.legend(fontsize=9)
+
+# ── B: Residuals ──────────────────────────────────────────────────────────────
+ax_b = fig_res.add_subplot(gs[0, 1])
+residuals = y_te - y_pred_rf
+ax_b.scatter(y_pred_rf, residuals, alpha=0.4, s=30, color='coral', edgecolors='none')
+ax_b.axhline(0, color='black', linestyle='--', linewidth=1.2)
+ax_b.set_title('Residual Plot\n(Tuned RF)', fontweight='bold')
+ax_b.set_xlabel('Predicted WS/48')
+ax_b.set_ylabel('Residual')
+
+# ── C: Feature Importances ────────────────────────────────────────────────────
+ax_c = fig_res.add_subplot(gs[0, 2])
+colors = sns.color_palette('mako', len(feat_imp_df))
+ax_c.barh(feat_imp_df['Feature'], feat_imp_df['Importance'],
+          color=colors, edgecolor='white')
+ax_c.invert_yaxis()
+ax_c.set_title('Feature Importances\n(RF Regression)', fontweight='bold')
+ax_c.set_xlabel('Mean Decrease in Impurity')
+
+# ── D: Model Comparison ───────────────────────────────────────────────────────
+ax_d = fig_res.add_subplot(gs[1, 0])
+model_names = list(reg_results_df.index) + ['RF (tuned)']
+rmse_vals   = list(reg_results_df['Test RMSE']) + [rf_test_rmse]
+bar_colors  = ['#aec6cf'] * 3 + ['#4682b4']
+bars = ax_d.bar(model_names, rmse_vals, color=bar_colors, edgecolor='white')
+ax_d.bar_label(bars, fmt='%.4f', padding=3, fontsize=8)
+ax_d.set_title('Regression Model Comparison\n(Test RMSE — lower is better)',
+               fontweight='bold')
+ax_d.set_ylabel('Test RMSE')
+ax_d.set_xticklabels(model_names, rotation=15, ha='right', fontsize=9)
+
+# ── E: ROC Curves ─────────────────────────────────────────────────────────────
+ax_e = fig_res.add_subplot(gs[1, 1])
+for name, pipe in pipelines_clf.items():
+    y_prob = pipe.predict_proba(X_te_c)[:, 1]
+    fpr, tpr, _ = roc_curve(y_te_c, y_prob)
+    auc = roc_auc_score(y_te_c, y_prob)
+    ax_e.plot(fpr, tpr, linewidth=2, label=f'{name} (AUC={auc:.3f})')
+ax_e.plot([0,1],[0,1],'k--', linewidth=1, label='Random classifier')
+ax_e.set_title('ROC Curves\n(Predicting 3+ Season Career)', fontweight='bold')
+ax_e.set_xlabel('False Positive Rate')
+ax_e.set_ylabel('True Positive Rate')
+ax_e.legend(fontsize=8)
+
+# ── F: Top 15 Players by WS/48 Table ─────────────────────────────────────────
+ax_f = fig_res.add_subplot(gs[1, 2])
+ax_f.axis('off')
+
+top15 = (df_ws.nlargest(15, 'NBA_WS_48')
+         [['Player_Name','Draft_Year','Overall_Pick','Drafting_Team',
+           'NBA_Years_Active','NBA_WS_48']]
+         .reset_index(drop=True))
+top15.index = top15.index + 1
+top15['NBA_WS_48'] = top15['NBA_WS_48'].round(4)
+top15['NBA_Years_Active'] = top15['NBA_Years_Active'].astype(int)
+
+tbl = ax_f.table(
+    cellText=top15.values,
+    colLabels=['Player','Year','Pick','Team','Yrs','WS/48'],
+    loc='center', cellLoc='center'
+)
+tbl.auto_set_font_size(False)
+tbl.set_fontsize(8)
+tbl.scale(1, 1.5)
+for j in range(6):
+    tbl[(0, j)].set_facecolor('#2c3e50')
+    tbl[(0, j)].set_text_props(color='white', fontweight='bold')
+for i in range(1, 16):
+    clr = '#f2f2f2' if i % 2 == 0 else 'white'
+    for j in range(6):
+        tbl[(i, j)].set_facecolor(clr)
+
+ax_f.set_title('Top 15 Players by Career WS/48\n(Real Data)', fontweight='bold', pad=12)
+
+fig_res.savefig('PSTAT100_Results_Dashboard.png', dpi=150, bbox_inches='tight')
+plt.close()
+print("  [Saved] PSTAT100_Results_Dashboard.png")
+
+# =============================================================================
+# SECTION 8: SUMMARY PRINTOUT
+# =============================================================================
+print("\n" + "=" * 70)
+print("SECTION 8: RESULTS SUMMARY")
+print("=" * 70)
+
+print("\n── Regression Model Comparison ──")
+print(reg_results_df.to_string())
+print(f"\n  Tuned RF  →  Test RMSE={rf_test_rmse:.4f}  R²={rf_test_r2:.4f}")
+print(f"  Best params: {rf_grid.best_params_}")
+
+print("\n── Classification Comparison ──")
+print(pd.DataFrame(clf_results).T.to_string())
+
+print("\n── Feature Importances ──")
+print(feat_imp_df.to_string(index=False))
+
+print("\n[DONE] Both dashboards saved as PNG.")
+print("       Convert to Jupyter notebook and add written sections per rubric.")
+
+# =============================================================================
+# SECTION 9: OPEN TWO SIDE-BY-SIDE WINDOWS
+# =============================================================================
+
+def show_image_window(png_path, title, x_pos, y_pos, width=960, height=780):
+    img = plt.imread(png_path)
+    fig = plt.figure(figsize=(width / 100, height / 100))
+    fig.canvas.manager.set_window_title(title)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.imshow(img)
+    ax.axis('off')
+    try:
+        fig.canvas.manager.window.wm_geometry(f"{width}x{height}+{x_pos}+{y_pos}")
+    except Exception:
+        pass
+    return fig
+
+show_image_window("PSTAT100_EDA_Dashboard.png",
+                  "Dashboard 1 — EDA", x_pos=0, y_pos=30)
+show_image_window("PSTAT100_Results_Dashboard.png",
+                  "Dashboard 2 — Modeling Results", x_pos=970, y_pos=30)
+
+print("\nBoth dashboards open. Close the windows to exit.")
+plt.show(block=True)
